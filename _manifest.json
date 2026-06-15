@@ -1,15 +1,16 @@
 {
   "manifest_version": 2,
-  "id": "com.example.my-log-watcher",
-  "version": "1.0.0",
+  "id": "1m.whatsmailog",
+  "version": "0.0.0",
   "name": "日志小窥",
   "description": "让麦麦能窥见自己的log，并提供LLM总结",
   "author": {
-    "name": "你的名字"
+    "name": "1m",
+	"url": "https://github.com/Emaginations"
   },
   "license": "Apache License 2.0",
   "urls": {
-    "repository": "https://github.com/你的用户名/你的仓库名"
+    "repository": "https://github.com/Emaginations/WhatsMaiLog"
   },
   "host_application": {
     "min_version": "1.0.0",
@@ -31,7 +32,7 @@
   ],
   "llm_providers": [
     {
-      "client_type": "com.example.my-log-watcher.provider",
+      "client_type": "1m.whatsmailog.provider",
       "name": "日志小窥 LLM Provider",
       "description": "用于总结和分析日志",
       "version": "1.0.0"
