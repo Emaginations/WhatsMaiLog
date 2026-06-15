@@ -1,0 +1,14 @@
+[plugin]
+enabled = true
+trigger_phrases = ["发生什么了{bot_name}", "是不是哪里出问题了"]
+log_minutes = 10
+max_log_lines = 50
+log_file_path = "logs/maibot.log"
+webui_only_commands = true
+
+[llm]
+enable_llm = true
+api_key = ""
+api_base = "https://api.deepseek.com"
+model_name = "deepseek-chat"
+temperature = 0.7
