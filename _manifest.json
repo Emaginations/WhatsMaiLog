@@ -1,0 +1,47 @@
+{
+  "manifest_version": 2,
+  "id": "com.example.my-log-watcher",
+  "version": "1.0.0",
+  "name": "日志小窥",
+  "description": "让麦麦能窥见自己的log，并提供LLM总结",
+  "author": {
+    "name": "你的名字"
+  },
+  "license": "Apache License 2.0",
+  "urls": {
+    "repository": "https://github.com/你的用户名/你的仓库名"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.0.1"
+  },
+  "sdk": {
+    "min_version": "1.0.0",
+    "max_version": "2.99.99"
+  },
+  "plugin_type": "management",
+  "display": {
+    "icon": {
+      "type": "emoji",
+      "value": "📋"
+    }
+  },
+  "capabilities": [
+    "send.text"
+  ],
+  "llm_providers": [
+    {
+      "client_type": "com.example.my-log-watcher.provider",
+      "name": "日志小窥 LLM Provider",
+      "description": "用于总结和分析日志",
+      "version": "1.0.0"
+    }
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN",
+      "ru-RU"
+    ]
+  }
+}
