@@ -13,7 +13,7 @@
   },
   "host_application": {
     "min_version": "1.0.0",
-    "max_version": "1.0.1"
+    "max_version": "1.0.4"
   },
   "sdk": {
     "min_version": "1.0.0",
