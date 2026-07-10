@@ -1,12 +1,12 @@
 {
   "manifest_version": 2,
   "id": "1m.whatsmailog",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "name": "日志小窥",
-  "description": "让麦麦能窥见自己的log，并提供LLM总结",
+  "description": "让麦麦能窥见自己的log，并提供LLM总结。支持自定义触发词、时间范围、日志路径，并可选择启用LLM进行智能总结。",
   "author": {
     "name": "1m",
-	"url": "https://github.com/Emaginations"
+    "url": "https://github.com/Emaginations"
   },
   "license": "Apache License 2.0",
   "urls": {
@@ -14,7 +14,7 @@
   },
   "host_application": {
     "min_version": "1.0.0",
-    "max_version": "1.0.4"
+    "max_version": "1.99.99"
   },
   "sdk": {
     "min_version": "1.0.0",
@@ -28,13 +28,14 @@
     }
   },
   "capabilities": [
-    "send.text"
+    "send.text",
+    "logger"
   ],
   "llm_providers": [
     {
       "client_type": "1m.whatsmailog.provider",
       "name": "日志小窥 LLM Provider",
-      "description": "用于总结和分析日志",
+      "description": "用于总结和分析日志的 OpenAI 兼容 LLM 提供商",
       "version": "1.0.0"
     }
   ],

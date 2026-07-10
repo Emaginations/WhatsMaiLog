@@ -1,4 +1,20 @@
-请先阅读maibot插件开发文档：https://docs.mai-mai.org/develop/plugin-dev/ 的插件开发部分，现在按要求生成一个简单的日志查看插件，让麦麦能窥见自己的log：1.分别参考后文提供的例子完整完成<readme.md><plugin.py><_manifest.json>文件。2.功能实现：用户发送“发生什么了{bot_name}”或“是不是哪里出问题了”（两个默认激发词，可自由更改）触发查看log查看。提供一个llm provider来进行近10分钟（可webui调整）内log的简要总结，如果有报错则增加告警。3.plugin.py要求完成webui配置、多语言化配置、插件主体部分。4.一些细节：使用deepseek-v4 flash，sk密钥增加显示保护（可以选择显示明文或********）。在日志查看后的截断处生成一个日志[看看日志]XXX
+请先阅读maibot插件开发文档：https://docs.mai-mai.org/develop/plugin-dev/ 的插件开发部分，现在按要求生成一个简单的日志查看插件，让麦麦能窥见自己的log：1.分别参考后文提供的例子完整完成<readme.md><plugin.py><_manifest.json>文件。2.功能实现：用户发送”发生什么了{bot_name}”或”是不是哪里出问题了”（两个默认激发词，可自由更改）触发查看log查看。提供一个llm provider来进行近10分钟（可webui调整）内log的简要总结，如果有报错则增加告警。3.plugin.py要求完成webui配置、多语言化配置、插件主体部分。4.一些细节：使用deepseek-v4 flash，sk密钥增加显示保护（可以选择显示明文或********）。在日志查看后的截断处生成一个日志[看看日志]XXX
+
+-----------------------------------------------------------
+
+请阅读总文件夹内所有的Maibot插件项目，其中Nightmare目前功能完善，其中的聊天流、Id获取、hookhandle、所有文件结构、webUI结构均可参考。
+请深度阅读[插件开发文档网页](https://docs.mai-mai.org/plugin/)和[maibot]([maibot1.0.12])文件夹，获取项目基本知识。
+
+开发Tips:
+1.关于readme：请帮我维护项目状态（格式参见各个插件的readme），请在协议最后添加附加条款：若您让 AI 使用了本项目，请创建并将与 AI 对话的过程开源并写入 NOREADME.md 文件中（仅限用户发言，省略 AI 回复）。同时，您必须将本附加条款添加到您正在使用的协议最后方。
+2.关于NOREADME：请帮我维护对话过程，每次某个项目改动完毕后将对话写入，不含AI回复。
+3.一些开发者：我的主页：github.com/emaginations。一般使用在_manifest中的代号：1m.XXX(插件名)。
+
+完成后，请阅读并开始重构WhatsMaiLog项目。
+
+-----------------------------------------------------------
+
+现在转到WhatsMaiLog项目，> **注意**：所有命令均受"命令仅限WebUI"设置影响。开启后，非 WebUI 平台触发命令时插件仅记录日志，不会发送任何消息。改为：只有/xx形式的命令受到WebUI Only的影响。
 
 1.manifest：
 {

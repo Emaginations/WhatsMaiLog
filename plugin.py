@@ -9,37 +9,51 @@
 2026-06-14 try6: 修正为正确的 Command 组件（从 maibot_sdk 导入 Command）
 2026-06-14 try7: 添加 /whatsmailog（仅WebUI）和 /llmtest 测试命令
 2026-06-14 try8: 修正配置模型继承 PluginConfigBase，修复 WebUI 无法加载配置的问题
+2026-07-10 try9: 重构项目，参考Nightmare项目优化代码结构、完善错误处理、添加英文多语言支持
+2026-07-11 try10: 修改WebUI限制逻辑：只有/xx形式命令受webui_only_commands限制，触发词不受影响
 """
 
 from maibot_sdk import Field, MaiBotPlugin, LLMProvider, LLMProviderBase, Command, PluginConfigBase
+from maibot_sdk.types import IncompatibleError
 from typing import ClassVar, List, Any, Dict, Optional
 from datetime import datetime, timedelta
 import aiohttp
 import os
 
 # ============================================================================
-# 多语言化支持（中文、俄语）
+# 多语言化支持（中文、英文、俄语）
 # ============================================================================
 def _schema_i18n(
-    label_zh: str,
+    *,
+    label_en: str,
     label_ru: str,
-    hint_zh: Optional[str] = None,
+    label_ja: Optional[str] = None,
+    hint_en: Optional[str] = None,
     hint_ru: Optional[str] = None,
-    placeholder_zh: Optional[str] = None,
+    hint_ja: Optional[str] = None,
+    placeholder_en: Optional[str] = None,
     placeholder_ru: Optional[str] = None,
+    placeholder_ja: Optional[str] = None,
 ) -> Dict[str, Dict[str, str]]:
-    i18n = {
-        "zh-CN": {"label": label_zh},
-        "ru-RU": {"label": label_ru},
+    """构造 WebUI 配置项多语言说明，支持英文、俄语、日语。"""
+    i18n: Dict[str, Dict[str, str]] = {
+        "en_US": {"label": label_en},
+        "ru_RU": {"label": label_ru},
     }
-    if hint_zh:
-        i18n["zh-CN"]["hint"] = hint_zh
+    if label_ja:
+        i18n["ja_JP"] = {"label": label_ja}
+    if hint_en:
+        i18n["en_US"]["hint"] = hint_en
     if hint_ru:
-        i18n["ru-RU"]["hint"] = hint_ru
-    if placeholder_zh:
-        i18n["zh-CN"]["placeholder"] = placeholder_zh
+        i18n["ru_RU"]["hint"] = hint_ru
+    if hint_ja:
+        i18n["ja_JP"]["hint"] = hint_ja
+    if placeholder_en:
+        i18n["en_US"]["placeholder"] = placeholder_en
     if placeholder_ru:
-        i18n["ru-RU"]["placeholder"] = placeholder_ru
+        i18n["ru_RU"]["placeholder"] = placeholder_ru
+    if placeholder_ja:
+        i18n["ja_JP"]["placeholder"] = placeholder_ja
     return i18n
 
 # ============================================================================
@@ -55,8 +69,22 @@ class LogWatcherPluginConfig(PluginConfigBase):
         description="是否启用日志小窥插件",
         json_schema_extra={
             "label": "开关",
-            "i18n": _schema_i18n("开关", "Включить"),
+            "i18n": _schema_i18n(label_en="Enable", label_ru="Включить"),
             "order": 0
+        }
+    )
+    config_version: str = Field(
+        default="2.0.0",
+        description="配置版本",
+        json_schema_extra={
+            "label": "配置版本",
+            "i18n": _schema_i18n(
+                label_en="Config version",
+                label_ru="Версия конфигурации",
+                hint_en="Configuration version number.",
+                hint_ru="Номер версии конфигурации."
+            ),
+            "order": 1
         }
     )
     trigger_phrases: List[str] = Field(
@@ -64,29 +92,40 @@ class LogWatcherPluginConfig(PluginConfigBase):
         description="触发关键词列表，可使用{bot_name}占位符",
         json_schema_extra={
             "label": "触发词",
+            "hint": "用户发送这些消息时触发插件，可使用{bot_name}占位符",
             "i18n": _schema_i18n(
-                "触发词", "Ключевые слова",
-                "用户发送这些消息时触发插件", "Плагин срабатывает при отправке этих сообщений"
+                label_en="Trigger phrases",
+                label_ru="Ключевые слова",
+                hint_en="Messages that trigger the plugin. Use {bot_name} as placeholder.",
+                hint_ru="Сообщения, при которых плагин срабатывает. Используйте {bot_name} как плейсхолдер."
             ),
-            "order": 1
-        }
-    )
-    log_minutes: int = Field(
-        default=10, ge=1, le=60,
-        description="查询日志的时间范围（分钟）",
-        json_schema_extra={
-            "label": "查询范围（分钟）",
-            "i18n": _schema_i18n("查询范围（分钟）", "Диапазон запроса (минуты)"),
             "order": 2
         }
     )
+    log_minutes: int = Field(
+        default=10, ge=1, le=120,
+        description="查询日志的时间范围（分钟）",
+        json_schema_extra={
+            "label": "查询范围（分钟）",
+            "hint": "获取多久之前的日志",
+            "i18n": _schema_i18n(
+                label_en="Query range (minutes)",
+                label_ru="Диапазон запроса (минуты)"
+            ),
+            "order": 3
+        }
+    )
     max_log_lines: int = Field(
-        default=50, ge=10, le=200,
+        default=50, ge=10, le=500,
         description="最多获取的日志行数",
         json_schema_extra={
             "label": "最大日志行数",
-            "i18n": _schema_i18n("最大日志行数", "Максимальное количество строк журнала"),
-            "order": 3
+            "hint": "最多获取的日志行数",
+            "i18n": _schema_i18n(
+                label_en="Max log lines",
+                label_ru="Максимальное количество строк журнала"
+            ),
+            "order": 4
         }
     )
     log_file_path: str = Field(
@@ -94,8 +133,12 @@ class LogWatcherPluginConfig(PluginConfigBase):
         description="日志文件路径（相对或绝对路径）",
         json_schema_extra={
             "label": "日志文件路径",
-            "i18n": _schema_i18n("日志文件路径", "Путь к файлу журнала"),
-            "order": 4
+            "placeholder": "logs/maibot.log",
+            "i18n": _schema_i18n(
+                label_en="Log file path",
+                label_ru="Путь к файлу журнала"
+            ),
+            "order": 5
         }
     )
     webui_only_commands: bool = Field(
@@ -103,8 +146,12 @@ class LogWatcherPluginConfig(PluginConfigBase):
         description="是否只有WebUI聊天可以触发 /whatsmailog 命令",
         json_schema_extra={
             "label": "命令仅限WebUI",
-            "i18n": _schema_i18n("命令仅限WebUI", "Команды только в WebUI"),
-            "order": 5
+            "hint": "开启后 /whatsmailog 命令仅在WebUI聊天中可用",
+            "i18n": _schema_i18n(
+                label_en="Commands only in WebUI",
+                label_ru="Команды только в WebUI"
+            ),
+            "order": 6
         }
     )
 
@@ -118,7 +165,10 @@ class LLMConfig(PluginConfigBase):
         description="是否启用LLM进行日志总结",
         json_schema_extra={
             "label": "启用LLM总结",
-            "i18n": _schema_i18n("启用LLM总结", "Включить сводку LLM"),
+            "i18n": _schema_i18n(
+                label_en="Enable LLM summary",
+                label_ru="Включить сводку LLM"
+            ),
             "order": 0
         }
     )
@@ -127,7 +177,11 @@ class LLMConfig(PluginConfigBase):
         description="DeepSeek API密钥（WebUI中会自动脱敏显示）",
         json_schema_extra={
             "label": "API密钥",
-            "i18n": _schema_i18n("API密钥", "Ключ API"),
+            "placeholder": "sk-...",
+            "i18n": _schema_i18n(
+                label_en="API Key",
+                label_ru="Ключ API"
+            ),
             "order": 1
         }
     )
@@ -136,7 +190,11 @@ class LLMConfig(PluginConfigBase):
         description="API地址",
         json_schema_extra={
             "label": "API地址",
-            "i18n": _schema_i18n("API地址", "Адрес API"),
+            "placeholder": "https://api.deepseek.com",
+            "i18n": _schema_i18n(
+                label_en="API Base URL",
+                label_ru="Адрес API"
+            ),
             "order": 2
         }
     )
@@ -145,7 +203,11 @@ class LLMConfig(PluginConfigBase):
         description="模型名称",
         json_schema_extra={
             "label": "模型名称",
-            "i18n": _schema_i18n("模型名称", "Название модели"),
+            "placeholder": "deepseek-chat",
+            "i18n": _schema_i18n(
+                label_en="Model Name",
+                label_ru="Название модели"
+            ),
             "order": 3
         }
     )
@@ -153,12 +215,15 @@ class LLMConfig(PluginConfigBase):
         default=0.7, ge=0.0, le=2.0,
         description="生成温度",
         json_schema_extra={
-            "label": "温度",
-            "i18n": _schema_i18n("温度", "Температура"),
+            "label": "温度 (Temperature)",
             "x-widget": "slider",
             "min": 0,
             "max": 2,
             "step": 0.1,
+            "i18n": _schema_i18n(
+                label_en="Temperature",
+                label_ru="Температура"
+            ),
             "order": 4
         }
     )
@@ -198,16 +263,18 @@ class LogWatcherLLMProvider(LLMProviderBase):
             "temperature": config.temperature,
             "stream": False
         }
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, headers=headers, timeout=30) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    raise RuntimeError(f"HTTP {resp.status}: {text}")
-                data = await resp.json()
-                choices = data.get("choices", [])
-                if not choices:
-                    raise RuntimeError("LLM 返回结果为空")
-                return {"content": choices[0]["message"]["content"].strip()}
+        # 使用复用的 session（如果有）
+        if self.plugin._http_session is None or self.plugin._http_session.closed:
+            self.plugin._http_session = aiohttp.ClientSession()
+        async with self.plugin._http_session.post(url, json=payload, headers=headers, timeout=30) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"HTTP {resp.status}: {text}")
+            data = await resp.json()
+            choices = data.get("choices", [])
+            if not choices:
+                raise RuntimeError("LLM 返回结果为空")
+            return {"content": choices[0]["message"]["content"].strip()}
 
     # 本插件不需要 embedding 和 audio_transcription，可以不覆写（默认抛出 NotImplementedError）
 
@@ -216,24 +283,37 @@ class LogWatcherLLMProvider(LLMProviderBase):
 # ============================================================================
 class LogWatcherPlugin(MaiBotPlugin):
     async def on_load(self) -> None:
-        # 插件加载时输出日志（符合 logger API 要求）
+        """插件加载时输出日志并初始化 Provider"""
         self.ctx.logger.info("[日志小窥] 插件已启动")
+        self._http_session: Optional[aiohttp.ClientSession] = None
         self.provider = LogWatcherLLMProvider(self)
 
     async def on_unload(self) -> None:
+        """插件卸载时关闭 HTTP session"""
         self.ctx.logger.info("[日志小窥] 插件已卸载")
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
+        """配置更新回调"""
         if scope == "self":
             self.ctx.logger.info("[日志小窥] 插件配置已更新: version=%s", version)
 
     config_model = LogWatcherConfig
 
+    @property
+    def _enabled(self) -> bool:
+        """检查插件是否启用"""
+        try:
+            return bool(self.config.plugin.enabled)
+        except Exception:
+            return False
+
     # @LLMProvider 必须与 _manifest.json 中的 llm_providers[0].client_type 完全一致
     @LLMProvider(
         "1m.whatsmailog.provider",
         name="日志小窥 LLM Provider",
-        description="用于总结和分析日志",
+        description="用于总结和分析日志的 OpenAI 兼容 LLM 提供商",
         version="1.0.0"
     )
     async def handle_llm(self, operation: str, request: Dict[str, Any]) -> Dict[str, Any]:
@@ -242,29 +322,33 @@ class LogWatcherPlugin(MaiBotPlugin):
 
     # ========== 辅助方法 ==========
     def _get_platform(self, message: dict) -> str:
-        """从消息中提取平台信息"""
+        """从消息中提取平台信息（参考 Nightmare 项目）"""
         platform = message.get("platform", "")
         if platform:
             return platform
         user_info = message.get("user_info", {})
-        platform = user_info.get("platform", "")
-        if platform:
-            return platform
+        if isinstance(user_info, dict):
+            platform = user_info.get("platform", "")
+            if platform:
+                return platform
         message_info = message.get("message_info", {})
-        platform = message_info.get("platform", "")
-        if platform:
-            return platform
+        if isinstance(message_info, dict):
+            platform = message_info.get("platform", "")
+            if platform:
+                return platform
         return "unknown"
 
     # ========== 日志获取 ==========
     async def _get_logs(self, minutes: int, max_lines: int, log_path: str) -> List[str]:
-        """获取最近几分钟的日志内容（通过读取日志文件）"""
+        """
+        获取最近几分钟的日志内容（通过读取日志文件）
+        支持的时间格式：[YYYY-MM-DD HH:MM:SS]
+        """
         now = datetime.now()
         start_time = now - timedelta(minutes=minutes)
-        logs = []
         try:
             if not os.path.exists(log_path):
-                self.ctx.logger.warning(f"[日志小窥] 日志文件不存在: {log_path}")
+                self.ctx.logger.warning("[日志小窥] 日志文件不存在: %s", log_path)
                 return [f"日志文件不存在: {log_path}"]
 
             with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -274,6 +358,10 @@ class LogWatcherPlugin(MaiBotPlugin):
             for line in reversed(lines):
                 if len(collected) >= max_lines:
                     break
+                line = line.strip()
+                if not line:
+                    continue
+                # 尝试解析时间戳
                 time_str = None
                 if line.startswith('[') and ']' in line:
                     possible_time = line[1:line.find(']')]
@@ -281,17 +369,20 @@ class LogWatcherPlugin(MaiBotPlugin):
                         dt = datetime.strptime(possible_time, "%Y-%m-%d %H:%M:%S")
                         if dt >= start_time:
                             time_str = possible_time
-                    except:
+                    except ValueError:
                         pass
-                if time_str is None:
-                    collected.append(line.strip())
-                else:
-                    if datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S") >= start_time:
-                        collected.append(line.strip())
+                # 有时间戳且在范围内，或无法解析时间戳（保留）
+                if time_str is not None:
+                    collected.append(line)
+                elif not time_str and not line.startswith('['):
+                    # 无时间戳前缀的行，可能是多行日志的续行，保留
+                    collected.append(line)
             collected.reverse()
-            return collected if collected else [f"最近 {minutes} 分钟内无日志记录"]
+            if not collected:
+                return [f"最近 {minutes} 分钟内无日志记录"]
+            return collected
         except Exception as e:
-            self.ctx.logger.error(f"[日志小窥] 读取日志失败: {e}", exc_info=True)
+            self.ctx.logger.error("[日志小窥] 读取日志失败: %s", e, exc_info=True)
             return [f"读取日志时出错: {str(e)}"]
 
     async def _generate_summary(self, logs: List[str]) -> str:
@@ -299,25 +390,26 @@ class LogWatcherPlugin(MaiBotPlugin):
         if not self.config.llm.enable_llm:
             return "（LLM总结未启用）"
 
+        # 限制日志长度，避免超出 token 限制
         log_text = "\n".join(logs[-50:])
         if len(log_text) > 8000:
             log_text = log_text[:8000] + "\n...(已截断)"
 
-        prompt = f"""
-你是一个日志分析助手。请根据以下最近的日志内容，生成一个简要的中文总结（200字以内）：
-- 如果有错误（ERROR 或 CRITICAL 级别），请明确指出并重点提示。
-- 总结主要的功能调用、异常情况和整体运行状态。
-
-日志内容：
-{log_text}
-"""
+        prompt = (
+            "你是一个专业的日志分析助手。请根据以下最近的日志内容，生成一个简洁的中文总结（150字以内）：\n"
+            "- 重点指出 ERROR 或 CRITICAL 级别的错误\n"
+            "- 总结主要的功能调用、异常情况和整体运行状态\n"
+            "- 不要包含用户昵称等隐私信息\n\n"
+            f"日志内容：\n{log_text}"
+        )
         try:
             response = await self.provider.get_response({
                 "message_list": [{"role": "user", "content": prompt}]
             })
-            return response.get("content", "生成总结失败")
+            content = response.get("content", "").strip()
+            return content if content else "生成总结失败"
         except Exception as e:
-            self.ctx.logger.error(f"[日志小窥] LLM调用失败: {e}", exc_info=True)
+            self.ctx.logger.error("[日志小窥] LLM调用失败: %s", e, exc_info=True)
             return f"LLM调用失败: {str(e)}"
 
     async def _send_log_report(self, stream_id: str) -> None:
@@ -329,38 +421,48 @@ class LogWatcherPlugin(MaiBotPlugin):
         logs = await self._get_logs(minutes, max_lines, log_path)
         summary = await self._generate_summary(logs)
 
+        # 检查是否有错误
         has_error = any("ERROR" in log or "CRITICAL" in log for log in logs)
 
+        # 构建回复消息
+        now = datetime.now().strftime("%H:%M:%S")
         if has_error:
             reply = f"⚠️ 检测到最近{minutes}分钟内出现错误！\n{summary}\n[看看日志]"
         else:
             reply = f"📋 最近{minutes}分钟的日志总结：\n{summary}\n[看看日志]"
 
-        if logs:
-            log_preview = "\n".join(logs[-3:])
-            if log_preview:
-                reply += f"\n\n--- 最新日志片段 ---\n{log_preview}"
+        # 添加最新日志片段（最多3行）
+        if logs and len(logs) > 0:
+            recent_logs = [log for log in logs[-3:] if log.strip()]
+            if recent_logs:
+                reply += f"\n\n--- 最新日志片段 ---\n" + "\n".join(recent_logs)
+
+        # 添加时间戳
+        reply += f"\n\n🕐 报告时间: {now}"
 
         await self.ctx.send.text(reply, stream_id)
-        self.ctx.logger.info(f"[日志小窥] 已向 {stream_id} 发送日志报告")
+        self.ctx.logger.info("[日志小窥] 已向 %s 发送日志报告", stream_id)
 
     # ========== 命令处理器 ==========
-    # 命令1：用户自定义触发词（正常使用）
     @Command(
         name="log_query",
-        description="触发日志查看",
+        description="触发日志查看（自定义触发词，不受WebUI限制）",
         pattern=r"(发生什么了|是不是哪里出问题了)"
     )
     async def on_log_query(self, **kwargs):
-        """当用户发送触发词时调用"""
-        if not self.config.plugin.enabled:
+        """当用户发送触发词时调用 - 触发词形式，不受 webui_only_commands 限制"""
+        if not self._enabled:
             return False, "插件未启用", 0
 
-        stream_id = kwargs["stream_id"]
+        stream_id = kwargs.get("stream_id", "")
+        if not stream_id:
+            self.ctx.logger.warning("[日志小窥] stream_id 为空，无法发送日志报告")
+            return False, "stream_id 为空", 0
+
+        # 触发词形式不受 webui_only_commands 限制，所有平台可用
         await self._send_log_report(stream_id)
         return True, "日志报告已发送", 1
 
-    # 命令2：手动触发命令 /whatsmailog（仅WebUI生效）
     @Command(
         name="whatsmailog",
         description="手动触发日志查看（仅WebUI）",
@@ -368,7 +470,7 @@ class LogWatcherPlugin(MaiBotPlugin):
     )
     async def on_whatsmailog(self, **kwargs):
         """手动触发日志查看，仅在 WebUI 生效（可配置）"""
-        if not self.config.plugin.enabled:
+        if not self._enabled:
             return False, "插件未启用", 0
 
         message = kwargs.get("message", {})
@@ -376,26 +478,37 @@ class LogWatcherPlugin(MaiBotPlugin):
 
         # 检查是否仅限 WebUI
         if self.config.plugin.webui_only_commands and platform != "webui":
-            self.ctx.logger.info(f"[日志小窥] /whatsmailog 命令在非WebUI平台被触发，已忽略。平台={platform}")
+            self.ctx.logger.info("[日志小窥] /whatsmailog 命令在非WebUI平台被触发，已忽略。平台=%s", platform)
             return False, "此命令仅在WebUI中可用", 0
 
-        stream_id = kwargs["stream_id"]
+        stream_id = kwargs.get("stream_id", "")
+        if not stream_id:
+            self.ctx.logger.warning("[日志小窥] stream_id 为空，无法发送日志报告")
+            return False, "stream_id 为空", 0
+
         await self._send_log_report(stream_id)
         return True, "日志报告已发送", 1
 
-    # 命令3：LLM连接测试命令 /llmtest（所有平台可用）
     @Command(
         name="llmtest",
         description="测试 LLM Provider 连接",
         pattern=r"^/llmtest$"
     )
     async def on_llmtest(self, **kwargs):
-        """测试 LLM Provider 是否正常工作"""
-        if not self.config.plugin.enabled:
-            await self.ctx.send.text("❌ 插件未启用", kwargs["stream_id"])
+        """测试 LLM Provider 是否正常工作 - /xx 形式命令，受 webui_only_commands 限制"""
+        if not self._enabled:
+            await self.ctx.send.text("❌ 插件未启用", kwargs.get("stream_id", ""))
             return False, "插件未启用", 0
 
-        stream_id = kwargs["stream_id"]
+        message = kwargs.get("message", {})
+        platform = self._get_platform(message)
+
+        # /xx 形式命令受 webui_only_commands 限制
+        if self.config.plugin.webui_only_commands and platform != "webui":
+            self.ctx.logger.info("[日志小窥] /llmtest 命令在非WebUI平台被触发，已忽略。平台=%s", platform)
+            return False, "此命令仅在WebUI中可用", 0
+
+        stream_id = kwargs.get("stream_id", "")
         config = self.config.llm
 
         if not config.enable_llm:
@@ -412,16 +525,41 @@ class LogWatcherPlugin(MaiBotPlugin):
             }
             response = await self.provider.get_response(test_request)
             result = response.get("content", "")
-            self.ctx.logger.info(f"[日志小窥] LLM 提供商测试成功，返回: {result}")
+            self.ctx.logger.info("[日志小窥] LLM 提供商测试成功，返回: %s", result)
             await self.ctx.send.text(f"✅ LLM 提供商测试成功，回复: {result}", stream_id)
             return True, "测试成功", 1
         except Exception as e:
-            self.ctx.logger.error(f"[日志小窥] LLM 提供商测试失败: {e}", exc_info=True)
+            self.ctx.logger.error("[日志小窥] LLM 提供商测试失败: %s", e, exc_info=True)
             await self.ctx.send.text(f"❌ LLM 提供商测试失败: {e}", stream_id)
             return False, f"测试失败: {e}", 0
+
+    @Command(
+        name="logpath",
+        description="查看当前日志文件路径",
+        pattern=r"^/logpath$"
+    )
+    async def on_logpath(self, **kwargs):
+        """查看当前配置的日志文件路径 - /xx 形式命令，受 webui_only_commands 限制"""
+        if not self._enabled:
+            return False, "插件未启用", 0
+
+        message = kwargs.get("message", {})
+        platform = self._get_platform(message)
+
+        # /xx 形式命令受 webui_only_commands 限制
+        if self.config.plugin.webui_only_commands and platform != "webui":
+            self.ctx.logger.info("[日志小窥] /logpath 命令在非WebUI平台被触发，已忽略。平台=%s", platform)
+            return False, "此命令仅在WebUI中可用", 0
+
+        stream_id = kwargs.get("stream_id", "")
+        log_path = self.config.plugin.log_file_path
+        exists = os.path.exists(log_path)
+        status = "✅ 存在" if exists else "❌ 不存在"
+        await self.ctx.send.text(f"📂 当前日志文件路径: {log_path}\n状态: {status}", stream_id)
+        return True, "已显示日志路径", 1
 
 
 def create_plugin():
     return LogWatcherPlugin()
 
-# try8
+# try10 - 2026-07-11 修改WebUI限制逻辑
