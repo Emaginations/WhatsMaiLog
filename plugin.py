@@ -14,7 +14,6 @@
 """
 
 from maibot_sdk import Field, MaiBotPlugin, LLMProvider, LLMProviderBase, Command, PluginConfigBase
-from maibot_sdk.types import IncompatibleError
 from typing import ClassVar, List, Any, Dict, Optional
 from datetime import datetime, timedelta
 import aiohttp
