@@ -338,19 +338,82 @@ class LogWatcherPlugin(MaiBotPlugin):
         return "unknown"
 
     # ========== 日志获取 ==========
+    def _resolve_log_path(self, log_path: str) -> str:
+        """
+        解析日志路径，支持 MaiBot 的 JSONL 格式日志。
+        MaiBot 日志格式：logs/app_YYYYMMDD_HHMMSS.log.jsonl
+        """
+        # 如果 log_path 是目录，查找最新的 .jsonl 文件
+        if os.path.isdir(log_path):
+            jsonl_files = sorted(
+                [f for f in os.listdir(log_path) if f.startswith("app_") and f.endswith(".log.jsonl")],
+                reverse=True,
+            )
+            if jsonl_files:
+                resolved = os.path.join(log_path, jsonl_files[0])
+                self.ctx.logger.info(f"[日志小窥] 日志目录中找到最新日志文件: {resolved}")
+                return resolved
+            self.ctx.logger.warning(f"[日志小窥] 日志目录中无 .jsonl 文件: {log_path}")
+            return log_path
+
+        # 如果 log_path 是文件路径但不存在，尝试在 logs/ 目录下查找
+        if not os.path.exists(log_path) and not os.path.isabs(log_path):
+            # 尝试从工作目录的 logs/ 子目录查找
+            alt_path = os.path.join("logs", os.path.basename(log_path))
+            if os.path.exists(alt_path):
+                self.ctx.logger.info(f"[日志小窥] 使用备用日志路径: {alt_path}")
+                return alt_path
+
+            # 尝试在 logs/ 目录下查找最新的 .jsonl 文件
+            if os.path.isdir("logs"):
+                jsonl_files = sorted(
+                    [f for f in os.listdir("logs") if f.startswith("app_") and f.endswith(".log.jsonl")],
+                    reverse=True,
+                )
+                if jsonl_files:
+                    resolved = os.path.join("logs", jsonl_files[0])
+                    self.ctx.logger.info(f"[日志小窥] 使用最新日志文件: {resolved}")
+                    return resolved
+
+        # 尝试常见的日志目录
+        for candidate in [
+            "/MaiMBot/logs",
+            "/app/logs",
+            os.path.join(os.getcwd(), "logs"),
+        ]:
+            if os.path.isdir(candidate):
+                jsonl_files = sorted(
+                    [f for f in os.listdir(candidate) if f.startswith("app_") and f.endswith(".log.jsonl")],
+                    reverse=True,
+                )
+                if jsonl_files:
+                    resolved = os.path.join(candidate, jsonl_files[0])
+                    self.ctx.logger.info(f"[日志小窥] 找到日志文件: {resolved}")
+                    return resolved
+
+        return log_path
+
     async def _get_logs(self, minutes: int, max_lines: int, log_path: str) -> List[str]:
         """
-        获取最近几分钟的日志内容（通过读取日志文件）
-        支持的时间格式：[YYYY-MM-DD HH:MM:SS]
+        获取最近几分钟的日志内容
+        支持 MaiBot JSONL 格式日志和普通文本日志
+        JSONL 格式：{"timestamp": "...", "level": "...", "event": "...", ...}
         """
+        import json
+
         now = datetime.now()
         start_time = now - timedelta(minutes=minutes)
-        try:
-            if not os.path.exists(log_path):
-                self.ctx.logger.warning("[日志小窥] 日志文件不存在: %s", log_path)
-                return [f"日志文件不存在: {log_path}"]
 
-            with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+        # 解析正确的日志路径
+        resolved_path = self._resolve_log_path(log_path)
+        self.ctx.logger.info(f"[日志小窥] 日志文件解析路径: {log_path} -> {resolved_path}")
+
+        if not os.path.exists(resolved_path):
+            self.ctx.logger.warning(f"[日志小窥] 日志文件不存在: {resolved_path}")
+            return [f"日志文件不存在: {resolved_path}"]
+
+        try:
+            with open(resolved_path, 'r', encoding='utf-8', errors='ignore') as f:
                 lines = f.readlines()
 
             collected = []
@@ -360,26 +423,58 @@ class LogWatcherPlugin(MaiBotPlugin):
                 line = line.strip()
                 if not line:
                     continue
-                # 尝试解析时间戳
-                time_str = None
-                if line.startswith('[') and ']' in line:
-                    possible_time = line[1:line.find(']')]
-                    try:
-                        dt = datetime.strptime(possible_time, "%Y-%m-%d %H:%M:%S")
-                        if dt >= start_time:
-                            time_str = possible_time
-                    except ValueError:
-                        pass
-                # 有时间戳且在范围内，或无法解析时间戳（保留）
-                if time_str is not None:
-                    collected.append(line)
-                elif not time_str and not line.startswith('['):
-                    # 无时间戳前缀的行，可能是多行日志的续行，保留
-                    collected.append(line)
+
+                # 尝试解析 JSONL 格式
+                log_timestamp = None
+                log_text = line
+
+                try:
+                    log_entry = json.loads(line)
+                    # 提取时间戳（JSONL 格式）
+                    ts_str = log_entry.get("timestamp", "")
+                    if ts_str:
+                        try:
+                            # 尝试 ISO 格式
+                            if "T" in ts_str:
+                                log_timestamp = datetime.fromisoformat(ts_str.replace("Z", "+00:00").replace("+00:00", ""))
+                            else:
+                                log_timestamp = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                        except (ValueError, TypeError):
+                            pass
+
+                    # 提取日志内容
+                    event_text = log_entry.get("event", "")
+                    level_text = log_entry.get("level", "")
+                    module_text = log_entry.get("logger_name") or log_entry.get("module") or ""
+
+                    # 构建可读的日志文本
+                    if event_text:
+                        log_text = f"[{ts_str}] [{level_text}] [{module_text}] {event_text}" if ts_str else event_text
+                    else:
+                        log_text = line
+
+                    # 时间过滤
+                    if log_timestamp and log_timestamp < start_time:
+                        continue
+
+                except json.JSONDecodeError:
+                    # 非 JSON 格式，尝试旧格式解析
+                    if line.startswith('[') and ']' in line:
+                        possible_time = line[1:line.find(']')]
+                        try:
+                            dt = datetime.strptime(possible_time, "%Y-%m-%d %H:%M:%S")
+                            if dt < start_time:
+                                continue
+                        except ValueError:
+                            pass
+
+                collected.append(log_text)
+
             collected.reverse()
             if not collected:
                 return [f"最近 {minutes} 分钟内无日志记录"]
             return collected
+
         except Exception as e:
             self.ctx.logger.error("[日志小窥] 读取日志失败: %s", e, exc_info=True)
             return [f"读取日志时出错: {str(e)}"]

@@ -4,7 +4,9 @@ config_version = "2.0.0"
 trigger_phrases = ["发生什么了{bot_name}", "是不是哪里出问题了"]
 log_minutes = 10
 max_log_lines = 50
-log_file_path = "logs/maibot.log"
+# MaiBot 日志格式: logs/app_YYYYMMDD_HHMMSS.log.jsonl
+# 设置为 logs/ 目录，插件会自动查找最新的 JSONL 日志文件
+log_file_path = "logs"
 # webui_only_commands: 仅影响 /xx 形式的命令，触发词（如"发生什么了"）不受此限制
 webui_only_commands = true
 
