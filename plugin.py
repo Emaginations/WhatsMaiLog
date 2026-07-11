@@ -822,12 +822,67 @@ class LogWatcherPlugin(MaiBotPlugin):
         return True, "已显示日志路径", 1
 
     @Command(
+        name="logfiles",
+        description="列出日志目录中所有 app_*.log.jsonl 文件及大小（调试用）",
+        pattern=r"^/logfiles$"
+    )
+    async def on_logfiles(self, **kwargs):
+        """列出日志目录中所有 JSONL 文件，帮助诊断日志文件分布问题"""
+        if not self._enabled:
+            return False, "插件未启用", 0
+
+        message = kwargs.get("message", {})
+        platform = self._get_platform(message)
+        if self.config.plugin.webui_only_commands and platform != "webui":
+            return False, "此命令仅在WebUI中可用", 0
+
+        stream_id = kwargs.get("stream_id", "")
+        if not stream_id:
+            return False, "stream_id 为空", 0
+
+        log_path = self.config.plugin.log_file_path
+        base_dir = log_path if os.path.isdir(log_path) else os.path.dirname(log_path)
+        if not base_dir or base_dir == "":
+            base_dir = "logs"
+
+        if not os.path.isdir(base_dir):
+            await self.ctx.send.text(f"❌ 日志目录不存在: {base_dir}", stream_id)
+            return False, "目录不存在", 0
+
+        all_files = []
+        for fname in os.listdir(base_dir):
+            if fname.startswith("app_") and fname.endswith(".log.jsonl"):
+                fpath = os.path.join(base_dir, fname)
+                size = os.path.getsize(fpath)
+                # 快速检测：读取前3行了解日志来源
+                try:
+                    with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                        first_line = f.readline().strip()
+                        try:
+                            entry = json.loads(first_line)
+                            logger_name = entry.get("logger_name", "?")
+                        except Exception:
+                            logger_name = "?"
+                except Exception:
+                    logger_name = "err"
+                all_files.append((fname, size, logger_name))
+
+        all_files.sort(reverse=True)
+        # 只展示最近10个
+        lines = [f"📁 日志目录: {base_dir} ({len(all_files)} 个文件)\n"]
+        for fname, size, logger in all_files[:10]:
+            size_kb = size / 1024
+            lines.append(f"  {fname}  {size_kb:.0f}KB  [{logger}]")
+
+        await self.ctx.send.text("\n".join(lines), stream_id)
+        return True, "已列出日志文件", 1
+
+    @Command(
         name="check_backend",
         description="提取最近的Maisaka后台输出",
         pattern=r"^/check_backend$"
     )
     async def on_check_backend(self, **kwargs):
-        """提取最近的Maisaka后台输出并直接发送至聊天流（不经过LLM总结）"""
         if not self._enabled:
             return False, "插件未启用", 0
 
@@ -867,22 +922,34 @@ class LogWatcherPlugin(MaiBotPlugin):
 
     async def _extract_maisaka_output(self, minutes: int, log_path: str) -> Optional[str]:
         """
-        从日志中提取最近一次Maisaka返回的纯文本（不经过LLM总结）
-        读取目录下所有最近的JSONL文件，确保不漏掉刚写入的日志
+        从JSONL日志中提取最近一次Maisaka推理输出
+        策略：
+        1. 优先查找包含"Maisaka 返回"框线格式的完整event
+        2. 回退：提取maisaka相关模块的日志行，按时间整理
         """
         now = datetime.now()
         start_time = now - timedelta(minutes=minutes)
 
-        # 收集所有需要扫描的日志文件
         log_files = self._find_log_files(log_path, start_time)
         if not log_files:
             self.ctx.logger.warning(f"[日志小窥] 未找到日志文件: {log_path}")
             return None
 
-        self.ctx.logger.info(f"[日志小窥] 扫描 {len(log_files)} 个日志文件: {[os.path.basename(f) for f in log_files]}")
+        self.ctx.logger.info(f"[日志小窥] 扫描 {len(log_files)} 个日志文件")
 
         try:
-            maisaka_entries = []  # (timestamp, event_text)
+            # 收集两类数据：
+            # a) 包含"Maisaka 返回"框的完整event (timestamp, event_text)
+            # b) maisaka模块的普通日志行 (timestamp, text)
+            box_entries = []
+            module_entries = []
+
+            # maisaka相关模块名（logger_name）
+            maisaka_modules = {
+                "maisaka_reasoning_engine", "maisaka_chat_loop",
+                "maisaka_turn_scheduler", "maisaka_expression_selector",
+                "MaiSaka", "maisaka",
+            }
 
             for file_path in log_files:
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -910,54 +977,38 @@ class LogWatcherPlugin(MaiBotPlugin):
                         except (ValueError, TypeError):
                             pass
 
-                    # 时间过滤
                     if log_timestamp is not None and log_timestamp < start_time:
                         continue
 
                     event_text = log_entry.get("event") or ""
+                    logger_name = log_entry.get("logger_name") or ""
 
-                    # 识别包含"Maisaka 返回"标记的event（框线中的推理输出）
+                    # 策略1：查找框线格式的Maisaka返回
                     if "Maisaka 返回" in event_text or "MaiSaka 返回" in event_text:
-                        maisaka_entries.append((log_timestamp, event_text))
+                        box_entries.append((log_timestamp, event_text))
 
-            if not maisaka_entries:
-                return None
+                    # 策略2：收集maisaka模块的普通日志
+                    if logger_name in maisaka_modules or any(
+                        kw.lower() in logger_name.lower()
+                        for kw in ("maisaka", "maisaka_turn", "maisaka_reasoning", "maisaka_chat")
+                    ):
+                        if event_text and "MaiSaka 循环" not in event_text:
+                            module_entries.append((log_timestamp, f"[{logger_name}] {event_text}"))
 
-            # 按时间排序，取最新一条
-            maisaka_entries.sort(key=lambda x: x[0] if x[0] else datetime.min, reverse=True)
-            latest_event = maisaka_entries[0][1]
+            # 策略1优先：如果找到框线格式的返回，提取纯文本
+            if box_entries:
+                box_entries.sort(key=lambda x: x[0] if x[0] else datetime.min, reverse=True)
+                cleaned = self._parse_maisaka_box(box_entries[0][1])
+                if cleaned:
+                    return cleaned
 
-            # 提取 Maisaka 返回部分的纯文本，去除框线
-            # 事件文本格式（JSONL中为\n分隔的完整框）：
-            # ╭─ Maisaka 返回 ─╮
-            # │ 实际内容...    │
-            # ╰───────────────╯
-            lines = latest_event.split('\n')
-            result_lines = []
-            in_return_block = False
-
-            for line in lines:
-                stripped = line.strip()
-                if "Maisaka 返回" in line or "MaiSaka 返回" in line:
-                    in_return_block = True
-                    continue
-                if in_return_block and stripped.startswith('╰') and '─' in stripped:
-                    break
-                if in_return_block:
-                    # 去除框线字符
-                    if '│' in line:
-                        idx = line.index('│')
-                        cleaned = line[idx + 1:]
-                        if '│' in cleaned:
-                            cleaned = cleaned[: cleaned.rindex('│')]
-                        cleaned = cleaned.strip()
-                    else:
-                        cleaned = line.replace('─', '').strip()
-                    if cleaned:
-                        result_lines.append(cleaned)
-
-            if result_lines:
-                return "\n".join(result_lines)
+            # 策略2回退：整理maisaka模块的日志行
+            if module_entries:
+                module_entries.sort(key=lambda x: x[0] if x[0] else datetime.min)
+                # 只取最近15条
+                recent = module_entries[-15:]
+                lines = [text for _, text in recent]
+                return "Maisaka 最近活动：\n" + "\n".join(lines)
 
             return None
 
@@ -965,50 +1016,90 @@ class LogWatcherPlugin(MaiBotPlugin):
             self.ctx.logger.error("[日志小窥] 提取Maisaka输出失败: %s", e, exc_info=True)
             return None
 
+    def _parse_maisaka_box(self, event_text: str) -> Optional[str]:
+        """解析Maisaka框线输出，提取"Maisaka 返回"部分的纯文本"""
+        lines = event_text.split('\n')
+        result_lines = []
+        in_return_block = False
+
+        for line in lines:
+            stripped = line.strip()
+            if "Maisaka 返回" in line or "MaiSaka 返回" in line:
+                in_return_block = True
+                continue
+            if in_return_block and stripped.startswith('╰') and '─' in stripped:
+                break
+            if in_return_block:
+                if '│' in line:
+                    idx = line.index('│')
+                    cleaned = line[idx + 1:]
+                    if '│' in cleaned:
+                        cleaned = cleaned[: cleaned.rindex('│')]
+                    cleaned = cleaned.strip()
+                else:
+                    cleaned = line.replace('─', '').strip()
+                if cleaned:
+                    result_lines.append(cleaned)
+
+        return "\n".join(result_lines) if result_lines else None
+
     def _find_log_files(self, log_path: str, start_time: datetime) -> List[str]:
-        """查找可能包含目标时间范围内日志的所有 JSONL 文件"""
-        # 解析基础目录
+        """查找包含目标时间范围内日志的所有 JSONL 文件"""
         base_dir = log_path if os.path.isdir(log_path) else os.path.dirname(log_path)
         if not base_dir or base_dir == "":
             base_dir = "logs"
 
         if not os.path.isdir(base_dir):
-            # 尝试解析为文件路径
             resolved = self._resolve_log_path(log_path)
             if os.path.isfile(resolved):
+                self.ctx.logger.info(f"[日志小窥] 单文件模式: {resolved}")
                 return [resolved]
-            # 回退到 logs/ 目录
             if os.path.isdir("logs"):
                 base_dir = "logs"
             else:
+                self.ctx.logger.warning(f"[日志小窥] 目录不存在: {base_dir}")
                 return []
 
-        # 收集文件名包含 time 范围的 .jsonl 文件
-        candidates = []
+        # 收集所有 app_*.log.jsonl 文件（不限于最新，因为 Host/Runner 文件可能不同名）
+        all_files = []
         for fname in os.listdir(base_dir):
-            if not (fname.startswith("app_") and fname.endswith(".log.jsonl")):
-                continue
-            # 从文件名提取时间: app_YYYYMMDD_HHMMSS.log.jsonl
+            if fname.startswith("app_") and fname.endswith(".log.jsonl"):
+                fpath = os.path.join(base_dir, fname)
+                size = os.path.getsize(fpath)
+                all_files.append((fname, fpath, size))
+
+        if not all_files:
+            self.ctx.logger.warning(f"[日志小窥] 目录 {base_dir} 中无 app_*.log.jsonl 文件")
+            return []
+
+        # 筛选：文件名时间在 start_time - 2小时缓冲内
+        # 使用宽缓冲确保不会遗漏 Host 日志文件（可能与 Runner 文件不同名）
+        file_cutoff = start_time - timedelta(hours=2)
+        candidates = []
+        for fname, fpath, size in all_files:
             try:
-                ts_part = fname[4:19]  # "YYYYMMDD_HHMMSS"
+                ts_part = fname[4:19]  # app_YYYYMMDD_HHMMSS
                 file_ts = datetime.strptime(ts_part, "%Y%m%d_%H%M%S")
             except (ValueError, IndexError):
-                candidates.append(os.path.join(base_dir, fname))
+                candidates.append((fpath, size))
                 continue
+            if file_ts >= file_cutoff:
+                candidates.append((fpath, size))
 
-            # 文件时间在 start_time 之后（前15分钟缓冲），说明可能包含相关日志
-            if file_ts >= (start_time - timedelta(minutes=15)):
-                candidates.append(os.path.join(base_dir, fname))
+        if not candidates and all_files:
+            # 回退：取最新 5 个文件（按文件名降序）
+            all_files.sort(key=lambda x: x[0], reverse=True)
+            candidates = [(f, s) for _, f, s in all_files[:5]]
 
-        # 确保至少包含最新文件
-        if not candidates:
-            resolved = self._resolve_log_path(log_path)
-            if os.path.isfile(resolved):
-                return [resolved]
+        # 按文件大小降序排列（Host 文件通常更大），优先读取
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        paths = [p for p, _ in candidates]
 
-        candidates.sort(reverse=True)
-        # 最多读取3个最新文件
-        return candidates[:3]
+        # 诊断日志
+        for fpath, size in candidates[:5]:
+            self.ctx.logger.info(f"[日志小窥] 候选日志文件: {os.path.basename(fpath)} ({size:,} bytes)")
+
+        return paths[:10]  # 最多10个文件
 
     # 触发词形式的"查你后台"（不受WebUI限制）
     @Command(
@@ -1044,4 +1135,4 @@ class LogWatcherPlugin(MaiBotPlugin):
 def create_plugin():
     return LogWatcherPlugin()
 
-# try15 - 2026-07-11 优化日志获取逻辑：_find_log_files 扫描多个JSONL文件防止漏读；MaiBot日志架构分析
+# try17 - 2026-07-11 _find_log_files改为读所有近2小时文件+按大小排序；添加/logfiles调试命令
