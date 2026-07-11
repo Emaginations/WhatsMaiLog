@@ -11,13 +11,18 @@
 2026-06-14 try8: 修正配置模型继承 PluginConfigBase，修复 WebUI 无法加载配置的问题
 2026-07-10 try9: 重构项目，参考Nightmare项目优化代码结构、完善错误处理、添加英文多语言支持
 2026-07-11 try10: 修改WebUI限制逻辑：只有/xx形式命令受webui_only_commands限制，触发词不受影响
+2026-07-11 try11: 修复触发词配置无效问题（动态读取config.trigger_phrases）+ 修复获取日志非最新问题
+2026-07-11 try12: 添加"查你后台"功能 - 提取Maisaka后台推理输出，不经过LLM总结直接发送至聊天流
+2026-07-11 try13: 修复list越界错误；查你后台仅提取"Maisaka 返回"纯文本；删除maisaka_keywords的WebUI配置
 """
 
 from maibot_sdk import Field, MaiBotPlugin, LLMProvider, LLMProviderBase, Command, PluginConfigBase
 from typing import ClassVar, List, Any, Dict, Optional
 from datetime import datetime, timedelta
 import aiohttp
+import json
 import os
+import re
 
 # ============================================================================
 # 多语言化支持（中文、英文、俄语）
@@ -151,6 +156,22 @@ class LogWatcherPluginConfig(PluginConfigBase):
                 label_ru="Команды только в WebUI"
             ),
             "order": 6
+        }
+    )
+    check_backend_trigger: str = Field(
+        default="查你后台",
+        description="触发Maisaka后台输出提取的关键词",
+        json_schema_extra={
+            "label": "查你后台触发词",
+            "hint": "发送此关键词可提取Maisaka后台推理输出，不经过LLM总结",
+            "placeholder": "查你后台",
+            "i18n": _schema_i18n(
+                label_en="Check backend trigger",
+                label_ru="Проверка бэкенда",
+                hint_en="Send this keyword to extract Maisaka backend reasoning output",
+                hint_ru="Отправьте это ключевое слово для извлечения вывода системы Maisaka"
+            ),
+            "order": 7
         }
     )
 
@@ -320,6 +341,83 @@ class LogWatcherPlugin(MaiBotPlugin):
         return await self.provider.dispatch(operation, request)
 
     # ========== 辅助方法 ==========
+    def _extract_text_from_message(self, message) -> str:
+        """从各种可能的消息格式中提取文本"""
+        if not isinstance(message, dict):
+            return ""
+        # 方式1：直接 text 字段
+        raw_text = message.get("text") or ""
+        if raw_text:
+            return raw_text
+        # 方式2：raw_message.text
+        raw_msg = message.get("raw_message", {})
+        if isinstance(raw_msg, dict):
+            raw_text = raw_msg.get("text") or ""
+            if raw_text:
+                return raw_text
+            # raw_message.message 列表
+            raw_segments = raw_msg.get("message", [])
+            if isinstance(raw_segments, list):
+                text_parts = []
+                for seg in raw_segments:
+                    if isinstance(seg, dict) and seg.get("type") == "text":
+                        data = seg.get("data", {})
+                        if isinstance(data, dict):
+                            text_parts.append(data.get("text", ""))
+                        elif isinstance(data, str):
+                            text_parts.append(data)
+                if text_parts:
+                    return "".join(text_parts)
+        elif isinstance(raw_msg, list):
+            text_parts = []
+            for seg in raw_msg:
+                if isinstance(seg, dict) and seg.get("type") == "text":
+                    data = seg.get("data", {})
+                    if isinstance(data, dict):
+                        text_parts.append(data.get("text", ""))
+                    elif isinstance(data, str):
+                        text_parts.append(data)
+            if text_parts:
+                return "".join(text_parts)
+        # 方式3：message 段列表
+        segments = message.get("message", [])
+        if isinstance(segments, list):
+            text_parts = []
+            for seg in segments:
+                if isinstance(seg, dict) and seg.get("type") == "text":
+                    data = seg.get("data", {})
+                    if isinstance(data, dict):
+                        text_parts.append(data.get("text", ""))
+                    elif isinstance(data, str):
+                        text_parts.append(data)
+            if text_parts:
+                return "".join(text_parts)
+        # 方式4：message_info.message
+        msg_info = message.get("message_info", {})
+        if isinstance(msg_info, dict):
+            raw_text = msg_info.get("text") or ""
+            if raw_text:
+                return raw_text
+            segments2 = msg_info.get("message", [])
+            if isinstance(segments2, list):
+                text_parts = []
+                for seg in segments2:
+                    if isinstance(seg, dict) and seg.get("type") == "text":
+                        data = seg.get("data", {})
+                        if isinstance(data, dict):
+                            text_parts.append(data.get("text", ""))
+                        elif isinstance(data, str):
+                            text_parts.append(data)
+                if text_parts:
+                    return "".join(text_parts)
+            # raw_message 在 message_info 内
+            raw_msg2 = msg_info.get("raw_message", {})
+            if isinstance(raw_msg2, dict):
+                raw_text = raw_msg2.get("text") or ""
+                if raw_text:
+                    return raw_text
+        return ""
+
     def _get_platform(self, message: dict) -> str:
         """从消息中提取平台信息（参考 Nightmare 项目）"""
         platform = message.get("platform", "")
@@ -393,18 +491,76 @@ class LogWatcherPlugin(MaiBotPlugin):
 
         return log_path
 
+    def _parse_log_line(self, line: str) -> Optional[tuple]:
+        """
+        解析单行日志，返回 (timestamp, formatted_text) 或 None
+        支持 JSONL 格式和普通文本格式
+        """
+        import json
+
+        line = line.strip()
+        if not line:
+            return None
+
+        # 尝试解析 JSONL 格式
+        try:
+            log_entry = json.loads(line)
+            ts_str = log_entry.get("timestamp", "")
+
+            # 解析时间戳
+            log_timestamp = None
+            if ts_str:
+                try:
+                    if "T" in ts_str:
+                        log_timestamp = datetime.fromisoformat(ts_str.replace("Z", "+00:00").replace("+00:00", ""))
+                    else:
+                        log_timestamp = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                except (ValueError, TypeError):
+                    pass
+
+            # 提取日志内容
+            event_text = log_entry.get("event", "")
+            level_text = log_entry.get("level", "")
+            module_text = log_entry.get("logger_name") or log_entry.get("module") or ""
+
+            # 构建可读的日志文本
+            if event_text:
+                log_text = f"[{ts_str}] [{level_text}] [{module_text}] {event_text}" if ts_str else event_text
+            else:
+                log_text = line
+
+            return (log_timestamp, log_text)
+
+        except json.JSONDecodeError:
+            pass
+
+        # 尝试普通文本格式 [YYYY-MM-DD HH:MM:SS] ...
+        log_timestamp = None
+        if line.startswith('[') and ']' in line:
+            possible_time = line[1:line.find(']')]
+            try:
+                log_timestamp = datetime.strptime(possible_time, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                pass
+
+        return (log_timestamp, line)
+
     async def _get_logs(self, minutes: int, max_lines: int, log_path: str) -> List[str]:
         """
         获取最近几分钟的日志内容
         支持 MaiBot JSONL 格式日志和普通文本日志
         JSONL 格式：{"timestamp": "...", "level": "...", "event": "...", ...}
+
+        策略：先获取当前时间 -> 读取所有日志 -> 按时间过滤 -> 取最新的 max_lines 条
         """
         import json
 
+        # 1. 先获取当前时间
         now = datetime.now()
         start_time = now - timedelta(minutes=minutes)
+        self.ctx.logger.info(f"[日志小窥] 获取日志: now={now}, start_time={start_time}, minutes={minutes}")
 
-        # 解析正确的日志路径
+        # 2. 解析正确的日志路径
         resolved_path = self._resolve_log_path(log_path)
         self.ctx.logger.info(f"[日志小窥] 日志文件解析路径: {log_path} -> {resolved_path}")
 
@@ -413,67 +569,50 @@ class LogWatcherPlugin(MaiBotPlugin):
             return [f"日志文件不存在: {resolved_path}"]
 
         try:
+            # 3. 读取所有日志行
             with open(resolved_path, 'r', encoding='utf-8', errors='ignore') as f:
                 lines = f.readlines()
 
-            collected = []
-            for line in reversed(lines):
-                if len(collected) >= max_lines:
-                    break
-                line = line.strip()
-                if not line:
+            self.ctx.logger.info(f"[日志小窥] 读取到 {len(lines)} 行日志")
+
+            # 4. 解析所有日志并过滤
+            all_logs = []
+            for line in lines:
+                parsed = self._parse_log_line(line)
+                if parsed is None:
                     continue
 
-                # 尝试解析 JSONL 格式
-                log_timestamp = None
-                log_text = line
+                log_timestamp, log_text = parsed
+                all_logs.append((log_timestamp, log_text))
 
-                try:
-                    log_entry = json.loads(line)
-                    # 提取时间戳（JSONL 格式）
-                    ts_str = log_entry.get("timestamp", "")
-                    if ts_str:
-                        try:
-                            # 尝试 ISO 格式
-                            if "T" in ts_str:
-                                log_timestamp = datetime.fromisoformat(ts_str.replace("Z", "+00:00").replace("+00:00", ""))
-                            else:
-                                log_timestamp = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                        except (ValueError, TypeError):
-                            pass
+            # 5. 按时间过滤，只保留最近 minutes 分钟内的日志
+            filtered_logs = []
+            for log_timestamp, log_text in all_logs:
+                if log_timestamp is not None:
+                    # 有时间戳，检查是否在时间范围内
+                    if log_timestamp >= start_time:
+                        filtered_logs.append((log_timestamp, log_text))
+                else:
+                    # 没有时间戳，保留（可能是格式不认识的日志）
+                    filtered_logs.append((log_timestamp, log_text))
 
-                    # 提取日志内容
-                    event_text = log_entry.get("event", "")
-                    level_text = log_entry.get("level", "")
-                    module_text = log_entry.get("logger_name") or log_entry.get("module") or ""
+            self.ctx.logger.info(f"[日志小窥] 时间过滤后剩余 {len(filtered_logs)} 行日志")
 
-                    # 构建可读的日志文本
-                    if event_text:
-                        log_text = f"[{ts_str}] [{level_text}] [{module_text}] {event_text}" if ts_str else event_text
-                    else:
-                        log_text = line
+            # 6. 按时间排序（最新的在前），取最新的 max_lines 条
+            # reverse=True 让最新的日志排在前面
+            filtered_logs.sort(key=lambda x: x[0] if x[0] else datetime.min, reverse=True)
 
-                    # 时间过滤
-                    if log_timestamp and log_timestamp < start_time:
-                        continue
+            # 取最新的 max_lines 条
+            latest_logs = filtered_logs[:max_lines]
 
-                except json.JSONDecodeError:
-                    # 非 JSON 格式，尝试旧格式解析
-                    if line.startswith('[') and ']' in line:
-                        possible_time = line[1:line.find(']')]
-                        try:
-                            dt = datetime.strptime(possible_time, "%Y-%m-%d %H:%M:%S")
-                            if dt < start_time:
-                                continue
-                        except ValueError:
-                            pass
+            # 7. 反转回时间正序（旧的在前，新的在后）
+            latest_logs.reverse()
 
-                collected.append(log_text)
-
-            collected.reverse()
-            if not collected:
+            if not latest_logs:
                 return [f"最近 {minutes} 分钟内无日志记录"]
-            return collected
+
+            # 返回格式化后的文本列表
+            return [log_text for _, log_text in latest_logs]
 
         except Exception as e:
             self.ctx.logger.error("[日志小窥] 读取日志失败: %s", e, exc_info=True)
@@ -537,16 +676,46 @@ class LogWatcherPlugin(MaiBotPlugin):
         await self.ctx.send.text(reply, stream_id)
         self.ctx.logger.info("[日志小窥] 已向 %s 发送日志报告", stream_id)
 
+    def _build_trigger_pattern(self) -> str:
+        """从配置构建触发词正则表达式"""
+        trigger_phrases = self.config.plugin.trigger_phrases
+        if not trigger_phrases:
+            # 默认触发词
+            trigger_phrases = ["发生什么了", "是不是哪里出问题了"]
+
+        # 转义特殊字符并构建正则
+        escaped = [re.escape(phrase) for phrase in trigger_phrases]
+        pattern = "|".join(escaped)
+        self.ctx.logger.info(f"[日志小窥] 构建触发词正则: {pattern}")
+        return pattern
+
     # ========== 命令处理器 ==========
     @Command(
         name="log_query",
         description="触发日志查看（自定义触发词，不受WebUI限制）",
-        pattern=r"(发生什么了|是不是哪里出问题了)"
+        pattern=r"(发生什么了|发生什么事了|是不是哪里出问题了)"  # 默认值，实际使用 _build_trigger_pattern 动态判断
     )
     async def on_log_query(self, **kwargs):
         """当用户发送触发词时调用 - 触发词形式，不受 webui_only_commands 限制"""
         if not self._enabled:
             return False, "插件未启用", 0
+
+        # 获取原始消息内容
+        message = kwargs.get("message", {})
+        raw_text = self._extract_text_from_message(message)
+
+        if not raw_text:
+            self.ctx.logger.warning("[日志小窥] 无法获取消息文本，跳过触发词检测")
+            self.ctx.logger.debug("[日志小窥] message 结构: %s", str(message)[:500])
+            return False, "无消息文本", 0
+
+        # 动态构建触发词正则并检测
+        pattern = self._build_trigger_pattern()
+        if not re.search(pattern, raw_text):
+            # 未匹配到触发词
+            return False, "未匹配触发词", 0
+
+        self.ctx.logger.info(f"[日志小窥] 触发词匹配成功: {raw_text[:50]}")
 
         stream_id = kwargs.get("stream_id", "")
         if not stream_id:
@@ -652,8 +821,227 @@ class LogWatcherPlugin(MaiBotPlugin):
         await self.ctx.send.text(f"📂 当前日志文件路径: {log_path}\n状态: {status}", stream_id)
         return True, "已显示日志路径", 1
 
+    @Command(
+        name="check_backend",
+        description="提取最近的Maisaka后台输出",
+        pattern=r"^/check_backend$"
+    )
+    async def on_check_backend(self, **kwargs):
+        """提取最近的Maisaka后台输出并直接发送至聊天流（不经过LLM总结）"""
+        if not self._enabled:
+            return False, "插件未启用", 0
+
+        message = kwargs.get("message", {})
+        platform = self._get_platform(message)
+
+        # /xx 形式命令受 webui_only_commands 限制
+        if self.config.plugin.webui_only_commands and platform != "webui":
+            self.ctx.logger.info("[日志小窥] /check_backend 命令在非WebUI平台被触发，已忽略。平台=%s", platform)
+            return False, "此命令仅在WebUI中可用", 0
+
+        stream_id = kwargs.get("stream_id", "")
+        if not stream_id:
+            self.ctx.logger.warning("[日志小窥] stream_id 为空，无法发送")
+            return False, "stream_id 为空", 0
+
+        # 获取配置
+        minutes = self.config.plugin.log_minutes
+        log_path = self.config.plugin.log_file_path
+
+        self.ctx.logger.info(f"[日志小窥] 查你后台: 查找最近{minutes}分钟的Maisaka输出")
+
+        # 提取Maisaka输出
+        maisaka_output = await self._extract_maisaka_output(minutes, log_path)
+
+        if maisaka_output:
+            # 截断过长的输出
+            if len(maisaka_output) > 4000:
+                maisaka_output = maisaka_output[:4000] + "\n\n...(输出已截断)"
+            await self.ctx.send.text(f"🔍 Maisaka 后台输出（最近{minutes}分钟）：\n\n{maisaka_output}", stream_id)
+            self.ctx.logger.info("[日志小窥] 已向 %s 发送Maisaka后台输出", stream_id)
+            return True, "Maisaka后台输出已发送", 1
+        else:
+            await self.ctx.send.text(f"📋 最近{minutes}分钟内未检测到Maisaka后台输出。", stream_id)
+            self.ctx.logger.info("[日志小窥] 最近{minutes}分钟内无Maisaka输出")
+            return True, "未检测到Maisaka输出", 1
+
+    async def _extract_maisaka_output(self, minutes: int, log_path: str) -> Optional[str]:
+        """
+        从日志中提取最近一次Maisaka返回的纯文本（不经过LLM总结）
+        读取目录下所有最近的JSONL文件，确保不漏掉刚写入的日志
+        """
+        now = datetime.now()
+        start_time = now - timedelta(minutes=minutes)
+
+        # 收集所有需要扫描的日志文件
+        log_files = self._find_log_files(log_path, start_time)
+        if not log_files:
+            self.ctx.logger.warning(f"[日志小窥] 未找到日志文件: {log_path}")
+            return None
+
+        self.ctx.logger.info(f"[日志小窥] 扫描 {len(log_files)} 个日志文件: {[os.path.basename(f) for f in log_files]}")
+
+        try:
+            maisaka_entries = []  # (timestamp, event_text)
+
+            for file_path in log_files:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    raw_lines = f.readlines()
+
+                for raw_line in raw_lines:
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+                    try:
+                        log_entry = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    ts_str = log_entry.get("timestamp", "")
+                    log_timestamp = None
+                    if ts_str:
+                        try:
+                            if "T" in ts_str:
+                                log_timestamp = datetime.fromisoformat(
+                                    ts_str.replace("Z", "+00:00").replace("+00:00", "")
+                                )
+                            else:
+                                log_timestamp = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                        except (ValueError, TypeError):
+                            pass
+
+                    # 时间过滤
+                    if log_timestamp is not None and log_timestamp < start_time:
+                        continue
+
+                    event_text = log_entry.get("event") or ""
+
+                    # 识别包含"Maisaka 返回"标记的event（框线中的推理输出）
+                    if "Maisaka 返回" in event_text or "MaiSaka 返回" in event_text:
+                        maisaka_entries.append((log_timestamp, event_text))
+
+            if not maisaka_entries:
+                return None
+
+            # 按时间排序，取最新一条
+            maisaka_entries.sort(key=lambda x: x[0] if x[0] else datetime.min, reverse=True)
+            latest_event = maisaka_entries[0][1]
+
+            # 提取 Maisaka 返回部分的纯文本，去除框线
+            # 事件文本格式（JSONL中为\n分隔的完整框）：
+            # ╭─ Maisaka 返回 ─╮
+            # │ 实际内容...    │
+            # ╰───────────────╯
+            lines = latest_event.split('\n')
+            result_lines = []
+            in_return_block = False
+
+            for line in lines:
+                stripped = line.strip()
+                if "Maisaka 返回" in line or "MaiSaka 返回" in line:
+                    in_return_block = True
+                    continue
+                if in_return_block and stripped.startswith('╰') and '─' in stripped:
+                    break
+                if in_return_block:
+                    # 去除框线字符
+                    if '│' in line:
+                        idx = line.index('│')
+                        cleaned = line[idx + 1:]
+                        if '│' in cleaned:
+                            cleaned = cleaned[: cleaned.rindex('│')]
+                        cleaned = cleaned.strip()
+                    else:
+                        cleaned = line.replace('─', '').strip()
+                    if cleaned:
+                        result_lines.append(cleaned)
+
+            if result_lines:
+                return "\n".join(result_lines)
+
+            return None
+
+        except Exception as e:
+            self.ctx.logger.error("[日志小窥] 提取Maisaka输出失败: %s", e, exc_info=True)
+            return None
+
+    def _find_log_files(self, log_path: str, start_time: datetime) -> List[str]:
+        """查找可能包含目标时间范围内日志的所有 JSONL 文件"""
+        # 解析基础目录
+        base_dir = log_path if os.path.isdir(log_path) else os.path.dirname(log_path)
+        if not base_dir or base_dir == "":
+            base_dir = "logs"
+
+        if not os.path.isdir(base_dir):
+            # 尝试解析为文件路径
+            resolved = self._resolve_log_path(log_path)
+            if os.path.isfile(resolved):
+                return [resolved]
+            # 回退到 logs/ 目录
+            if os.path.isdir("logs"):
+                base_dir = "logs"
+            else:
+                return []
+
+        # 收集文件名包含 time 范围的 .jsonl 文件
+        candidates = []
+        for fname in os.listdir(base_dir):
+            if not (fname.startswith("app_") and fname.endswith(".log.jsonl")):
+                continue
+            # 从文件名提取时间: app_YYYYMMDD_HHMMSS.log.jsonl
+            try:
+                ts_part = fname[4:19]  # "YYYYMMDD_HHMMSS"
+                file_ts = datetime.strptime(ts_part, "%Y%m%d_%H%M%S")
+            except (ValueError, IndexError):
+                candidates.append(os.path.join(base_dir, fname))
+                continue
+
+            # 文件时间在 start_time 之后（前15分钟缓冲），说明可能包含相关日志
+            if file_ts >= (start_time - timedelta(minutes=15)):
+                candidates.append(os.path.join(base_dir, fname))
+
+        # 确保至少包含最新文件
+        if not candidates:
+            resolved = self._resolve_log_path(log_path)
+            if os.path.isfile(resolved):
+                return [resolved]
+
+        candidates.sort(reverse=True)
+        # 最多读取3个最新文件
+        return candidates[:3]
+
+    # 触发词形式的"查你后台"（不受WebUI限制）
+    @Command(
+        name="check_backend_trigger",
+        description="触发词形式的查你后台（不受WebUI限制）",
+        pattern=r"^(查你后台|查看后台|backend)$"
+    )
+    async def on_check_backend_trigger(self, **kwargs):
+        """触发词形式的查你后台 - 触发词形式，不受 webui_only_commands 限制"""
+        if not self._enabled:
+            return False, "插件未启用", 0
+
+        stream_id = kwargs.get("stream_id", "")
+        if not stream_id:
+            return False, "stream_id 为空", 0
+
+        # 复用核心逻辑
+        minutes = self.config.plugin.log_minutes
+        log_path = self.config.plugin.log_file_path
+
+        maisaka_output = await self._extract_maisaka_output(minutes, log_path)
+
+        if maisaka_output:
+            if len(maisaka_output) > 4000:
+                maisaka_output = maisaka_output[:4000] + "\n\n...(输出已截断)"
+            await self.ctx.send.text(f"🔍 Maisaka 后台输出（最近{minutes}分钟）：\n\n{maisaka_output}", stream_id)
+            return True, "Maisaka后台输出已发送", 1
+        else:
+            await self.ctx.send.text(f"📋 最近{minutes}分钟内未检测到Maisaka后台输出。", stream_id)
+            return True, "未检测到Maisaka输出", 1
+
 
 def create_plugin():
     return LogWatcherPlugin()
 
-# try10 - 2026-07-11 修改WebUI限制逻辑
+# try15 - 2026-07-11 优化日志获取逻辑：_find_log_files 扫描多个JSONL文件防止漏读；MaiBot日志架构分析
