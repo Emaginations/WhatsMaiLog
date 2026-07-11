@@ -14,6 +14,12 @@
 2026-07-11 try11: 修复触发词配置无效问题（动态读取config.trigger_phrases）+ 修复获取日志非最新问题
 2026-07-11 try12: 添加"查你后台"功能 - 提取Maisaka后台推理输出，不经过LLM总结直接发送至聊天流
 2026-07-11 try13: 修复list越界错误；查你后台仅提取"Maisaka 返回"纯文本；删除maisaka_keywords的WebUI配置
+2026-07-11 try14: "查你后台"触发词加回WebUI配置；重构消息文本提取逻辑（_extract_text_from_message）
+2026-07-11 try15: 多文件扫描（_find_log_files）；MaiBot日志架构分析（JSONL event字段含框线输出）
+2026-07-11 try16: 查你后台双策略：框线"Maisaka 返回"优先 → 回退提取maisaka模块日志行
+2026-07-11 try17: _find_log_files改为读所有近2小时文件+按大小排序；添加/logfiles调试命令
+2026-07-11 try18: _extract_maisaka_output 改为直接读取 logs/maisaka_prompt/ 目录的JSON文件（真正来源）
+2026-07-11 try19: 聊天流优先匹配（_get_chat_dir）；Maisaka返回集成入日志小窥+LLM总结
 """
 
 from maibot_sdk import Field, MaiBotPlugin, LLMProvider, LLMProviderBase, Command, PluginConfigBase
@@ -341,6 +347,39 @@ class LogWatcherPlugin(MaiBotPlugin):
         return await self.provider.dispatch(operation, request)
 
     # ========== 辅助方法 ==========
+    def _get_chat_dir(self, message) -> Optional[str]:
+        """从消息中提取 maisaka_prompt 子目录名（如 qq_group_227288331 或 qq_private_331701160）"""
+        if not isinstance(message, dict):
+            return None
+        platform = self._get_platform(message)
+
+        # 获取群/私聊 ID
+        group_id = None
+        user_id = None
+
+        # 从 message_info 中提取
+        msg_info = message.get("message_info", {})
+        if isinstance(msg_info, dict):
+            group_info = msg_info.get("group_info", {})
+            if isinstance(group_info, dict):
+                group_id = str(group_info.get("group_id", ""))
+            user_info = msg_info.get("user_info", {})
+            if isinstance(user_info, dict):
+                user_id = str(user_info.get("user_id", ""))
+
+        # 从顶层字段提取
+        if not group_id:
+            group_id = str(message.get("group_id", "") or "")
+        if not user_id:
+            user_id = str(message.get("user_id", "") or "")
+
+        platform_prefix = platform.lower() if platform else "qq"
+        if group_id:
+            return f"{platform_prefix}_group_{group_id}"
+        if user_id:
+            return f"{platform_prefix}_private_{user_id}"
+        return None
+
     def _extract_text_from_message(self, message) -> str:
         """从各种可能的消息格式中提取文本"""
         if not isinstance(message, dict):
@@ -618,63 +657,74 @@ class LogWatcherPlugin(MaiBotPlugin):
             self.ctx.logger.error("[日志小窥] 读取日志失败: %s", e, exc_info=True)
             return [f"读取日志时出错: {str(e)}"]
 
-    async def _generate_summary(self, logs: List[str]) -> str:
-        """调用 LLM 生成日志总结（通过 Provider）"""
-        if not self.config.llm.enable_llm:
-            return "（LLM总结未启用）"
-
-        # 限制日志长度，避免超出 token 限制
-        log_text = "\n".join(logs[-50:])
-        if len(log_text) > 8000:
-            log_text = log_text[:8000] + "\n...(已截断)"
-
-        prompt = (
-            "你是一个专业的日志分析助手。请根据以下最近的日志内容，生成一个简洁的中文总结（150字以内）：\n"
-            "- 重点指出 ERROR 或 CRITICAL 级别的错误\n"
-            "- 总结主要的功能调用、异常情况和整体运行状态\n"
-            "- 不要包含用户昵称等隐私信息\n\n"
-            f"日志内容：\n{log_text}"
-        )
-        try:
-            response = await self.provider.get_response({
-                "message_list": [{"role": "user", "content": prompt}]
-            })
-            content = response.get("content", "").strip()
-            return content if content else "生成总结失败"
-        except Exception as e:
-            self.ctx.logger.error("[日志小窥] LLM调用失败: %s", e, exc_info=True)
-            return f"LLM调用失败: {str(e)}"
-
-    async def _send_log_report(self, stream_id: str) -> None:
+    async def _send_log_report(self, stream_id: str, message=None) -> None:
         """发送日志报告的核心逻辑（供命令复用）"""
         minutes = self.config.plugin.log_minutes
         max_lines = self.config.plugin.max_log_lines
         log_path = self.config.plugin.log_file_path
 
+        # 1. 获取系统日志
         logs = await self._get_logs(minutes, max_lines, log_path)
-        summary = await self._generate_summary(logs)
 
-        # 检查是否有错误
+        # 2. 获取当前聊天流的 Maisaka 推理返回
+        chat_dir = self._get_chat_dir(message) if message else None
+        maisaka_output = await self._extract_maisaka_output(minutes, log_path, chat_dir)
+
+        # 3. 构建总结内容
+        log_text = "\n".join(logs[-50:])
+        if len(log_text) > 6000:
+            log_text = log_text[:6000] + "\n...(已截断)"
+
+        has_maisaka = bool(maisaka_output)
         has_error = any("ERROR" in log or "CRITICAL" in log for log in logs)
 
-        # 构建回复消息
+        # 4. LLM 总结（包含 Maisaka 返回）
+        if self.config.llm.enable_llm and (log_text.strip() or has_maisaka):
+            summary_prompt = (
+                "你是一个专业的日志分析助手。请根据以下内容生成一个简洁的中文总结（150字以内）：\n"
+                "- 重点指出 ERROR 或 CRITICAL 级别的错误\n"
+                "- 总结主要的功能调用、异常情况和整体运行状态\n"
+                "- 如果包含 Maisaka 推理输出，简述其核心分析和决策\n"
+                "- 不要包含用户昵称等隐私信息\n\n"
+            )
+            if log_text.strip():
+                summary_prompt += f"系统日志：\n{log_text}\n\n"
+            if has_maisaka:
+                maisaka_brief = maisaka_output
+                if len(maisaka_brief) > 2000:
+                    maisaka_brief = maisaka_brief[:2000] + "\n...(截断)"
+                summary_prompt += f"Maisaka 推理输出：\n{maisaka_brief}"
+
+            try:
+                response = await self.provider.get_response({
+                    "message_list": [{"role": "user", "content": summary_prompt}]
+                })
+                summary = response.get("content", "").strip()
+                if not summary:
+                    summary = "生成总结失败"
+            except Exception as e:
+                self.ctx.logger.error("[日志小窥] LLM调用失败: %s", e, exc_info=True)
+                summary = f"LLM调用失败: {str(e)}"
+        else:
+            summary = "（LLM总结未启用或无日志内容）"
+
+        # 5. 构建回复
         now = datetime.now().strftime("%H:%M:%S")
         if has_error:
             reply = f"⚠️ 检测到最近{minutes}分钟内出现错误！\n{summary}\n[看看日志]"
         else:
             reply = f"📋 最近{minutes}分钟的日志总结：\n{summary}\n[看看日志]"
 
-        # 添加最新日志片段（最多3行）
+        # 添加最新日志片段
         if logs and len(logs) > 0:
             recent_logs = [log for log in logs[-3:] if log.strip()]
             if recent_logs:
                 reply += f"\n\n--- 最新日志片段 ---\n" + "\n".join(recent_logs)
 
-        # 添加时间戳
         reply += f"\n\n🕐 报告时间: {now}"
 
         await self.ctx.send.text(reply, stream_id)
-        self.ctx.logger.info("[日志小窥] 已向 %s 发送日志报告", stream_id)
+        self.ctx.logger.info("[日志小窥] 已向 %s 发送日志报告 (含Maisaka: %s)", stream_id, has_maisaka)
 
     def _build_trigger_pattern(self) -> str:
         """从配置构建触发词正则表达式"""
@@ -723,7 +773,7 @@ class LogWatcherPlugin(MaiBotPlugin):
             return False, "stream_id 为空", 0
 
         # 触发词形式不受 webui_only_commands 限制，所有平台可用
-        await self._send_log_report(stream_id)
+        await self._send_log_report(stream_id, message)
         return True, "日志报告已发送", 1
 
     @Command(
@@ -749,7 +799,7 @@ class LogWatcherPlugin(MaiBotPlugin):
             self.ctx.logger.warning("[日志小窥] stream_id 为空，无法发送日志报告")
             return False, "stream_id 为空", 0
 
-        await self._send_log_report(stream_id)
+        await self._send_log_report(stream_id, message)
         return True, "日志报告已发送", 1
 
     @Command(
@@ -902,14 +952,14 @@ class LogWatcherPlugin(MaiBotPlugin):
         # 获取配置
         minutes = self.config.plugin.log_minutes
         log_path = self.config.plugin.log_file_path
+        chat_dir = self._get_chat_dir(message)
 
-        self.ctx.logger.info(f"[日志小窥] 查你后台: 查找最近{minutes}分钟的Maisaka输出")
+        self.ctx.logger.info(f"[日志小窥] 查你后台: 查找最近{minutes}分钟的Maisaka输出 (chat={chat_dir})")
 
-        # 提取Maisaka输出
-        maisaka_output = await self._extract_maisaka_output(minutes, log_path)
+        # 提取Maisaka输出（优先当前聊天流）
+        maisaka_output = await self._extract_maisaka_output(minutes, log_path, chat_dir)
 
         if maisaka_output:
-            # 截断过长的输出
             if len(maisaka_output) > 4000:
                 maisaka_output = maisaka_output[:4000] + "\n\n...(输出已截断)"
             await self.ctx.send.text(f"🔍 Maisaka 后台输出（最近{minutes}分钟）：\n\n{maisaka_output}", stream_id)
@@ -920,128 +970,85 @@ class LogWatcherPlugin(MaiBotPlugin):
             self.ctx.logger.info("[日志小窥] 最近{minutes}分钟内无Maisaka输出")
             return True, "未检测到Maisaka输出", 1
 
-    async def _extract_maisaka_output(self, minutes: int, log_path: str) -> Optional[str]:
+    async def _extract_maisaka_output(self, minutes: int, log_path: str, chat_dir: Optional[str] = None) -> Optional[str]:
         """
-        从JSONL日志中提取最近一次Maisaka推理输出
-        策略：
-        1. 优先查找包含"Maisaka 返回"框线格式的完整event
-        2. 回退：提取maisaka相关模块的日志行，按时间整理
+        从 logs/maisaka_prompt/ 目录读取最近一次 Maisaka 推理输出。
+        chat_dir: 优先匹配的聊天流目录名（如 qq_group_227288331）。
+                  如果指定且有匹配，只返回该聊天的；否则返回最新的任意聊天流。
         """
         now = datetime.now()
         start_time = now - timedelta(minutes=minutes)
 
-        log_files = self._find_log_files(log_path, start_time)
-        if not log_files:
-            self.ctx.logger.warning(f"[日志小窥] 未找到日志文件: {log_path}")
+        base_dir = log_path if os.path.isdir(log_path) else os.path.dirname(log_path)
+        if not base_dir or base_dir == "":
+            base_dir = "logs"
+        prompt_dir = os.path.join(base_dir, "maisaka_prompt")
+        if not os.path.isdir(prompt_dir):
+            self.ctx.logger.info(f"[日志小窥] maisaka_prompt 目录不存在: {prompt_dir}")
             return None
-
-        self.ctx.logger.info(f"[日志小窥] 扫描 {len(log_files)} 个日志文件")
 
         try:
-            # 收集两类数据：
-            # a) 包含"Maisaka 返回"框的完整event (timestamp, event_text)
-            # b) maisaka模块的普通日志行 (timestamp, text)
-            box_entries = []
-            module_entries = []
+            # 收集候选文件: (mtime, path, kind, chat_dir_name)
+            candidates = []
+            # 同时收集 chat_dir 匹配的候选项
+            preferred_candidates = []
 
-            # maisaka相关模块名（logger_name）
-            maisaka_modules = {
-                "maisaka_reasoning_engine", "maisaka_chat_loop",
-                "maisaka_turn_scheduler", "maisaka_expression_selector",
-                "MaiSaka", "maisaka",
-            }
-
-            for file_path in log_files:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    raw_lines = f.readlines()
-
-                for raw_line in raw_lines:
-                    raw_line = raw_line.strip()
-                    if not raw_line:
+            for kind in ("planner", "replyer"):
+                kind_dir = os.path.join(prompt_dir, kind)
+                if not os.path.isdir(kind_dir):
+                    continue
+                for cdir in os.listdir(kind_dir):
+                    chat_path = os.path.join(kind_dir, cdir)
+                    if not os.path.isdir(chat_path):
                         continue
-                    try:
-                        log_entry = json.loads(raw_line)
-                    except json.JSONDecodeError:
-                        continue
+                    for fname in os.listdir(chat_path):
+                        if not fname.endswith(".json"):
+                            continue
+                        fpath = os.path.join(chat_path, fname)
+                        mtime = os.path.getmtime(fpath)
+                        if mtime >= start_time.timestamp():
+                            entry = (mtime, fpath, kind, cdir)
+                            candidates.append(entry)
+                            if chat_dir and cdir == chat_dir:
+                                preferred_candidates.append(entry)
 
-                    ts_str = log_entry.get("timestamp", "")
-                    log_timestamp = None
-                    if ts_str:
-                        try:
-                            if "T" in ts_str:
-                                log_timestamp = datetime.fromisoformat(
-                                    ts_str.replace("Z", "+00:00").replace("+00:00", "")
-                                )
-                            else:
-                                log_timestamp = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                        except (ValueError, TypeError):
-                            pass
+            if not candidates:
+                return None
 
-                    if log_timestamp is not None and log_timestamp < start_time:
-                        continue
+            # 优先取当前聊天流的，否则取最新的
+            if preferred_candidates:
+                candidates = preferred_candidates
 
-                    event_text = log_entry.get("event") or ""
-                    logger_name = log_entry.get("logger_name") or ""
+            candidates.sort(reverse=True)
+            latest_mtime, latest_path, latest_kind, latest_chat = candidates[0]
 
-                    # 策略1：查找框线格式的Maisaka返回
-                    if "Maisaka 返回" in event_text or "MaiSaka 返回" in event_text:
-                        box_entries.append((log_timestamp, event_text))
+            self.ctx.logger.info(f"[日志小窥] Maisaka文件: {latest_kind}/{latest_chat}/{os.path.basename(latest_path)}")
 
-                    # 策略2：收集maisaka模块的普通日志
-                    if logger_name in maisaka_modules or any(
-                        kw.lower() in logger_name.lower()
-                        for kw in ("maisaka", "maisaka_turn", "maisaka_reasoning", "maisaka_chat")
-                    ):
-                        if event_text and "MaiSaka 循环" not in event_text:
-                            module_entries.append((log_timestamp, f"[{logger_name}] {event_text}"))
+            with open(latest_path, 'r', encoding='utf-8', errors='ignore') as f:
+                data = json.load(f)
 
-            # 策略1优先：如果找到框线格式的返回，提取纯文本
-            if box_entries:
-                box_entries.sort(key=lambda x: x[0] if x[0] else datetime.min, reverse=True)
-                cleaned = self._parse_maisaka_box(box_entries[0][1])
-                if cleaned:
-                    return cleaned
+            metadata = data.get("metadata", {})
+            output = data.get("output", {})
+            content = output.get("content", "")
 
-            # 策略2回退：整理maisaka模块的日志行
-            if module_entries:
-                module_entries.sort(key=lambda x: x[0] if x[0] else datetime.min)
-                # 只取最近15条
-                recent = module_entries[-15:]
-                lines = [text for _, text in recent]
-                return "Maisaka 最近活动：\n" + "\n".join(lines)
+            if not content:
+                return None
 
-            return None
+            kind_label = "Planner 推理" if latest_kind == "planner" else "Replyer 回复"
+            model = metadata.get("model_name", "未知")
+            duration = metadata.get("duration_ms", 0)
+
+            lines = []
+            lines.append(f"【{kind_label}】")
+            lines.append(f"模型：{model} | 耗时：{duration:.1f}s")
+            lines.append("")
+            lines.append(content)
+
+            return "\n".join(lines)
 
         except Exception as e:
             self.ctx.logger.error("[日志小窥] 提取Maisaka输出失败: %s", e, exc_info=True)
             return None
-
-    def _parse_maisaka_box(self, event_text: str) -> Optional[str]:
-        """解析Maisaka框线输出，提取"Maisaka 返回"部分的纯文本"""
-        lines = event_text.split('\n')
-        result_lines = []
-        in_return_block = False
-
-        for line in lines:
-            stripped = line.strip()
-            if "Maisaka 返回" in line or "MaiSaka 返回" in line:
-                in_return_block = True
-                continue
-            if in_return_block and stripped.startswith('╰') and '─' in stripped:
-                break
-            if in_return_block:
-                if '│' in line:
-                    idx = line.index('│')
-                    cleaned = line[idx + 1:]
-                    if '│' in cleaned:
-                        cleaned = cleaned[: cleaned.rindex('│')]
-                    cleaned = cleaned.strip()
-                else:
-                    cleaned = line.replace('─', '').strip()
-                if cleaned:
-                    result_lines.append(cleaned)
-
-        return "\n".join(result_lines) if result_lines else None
 
     def _find_log_files(self, log_path: str, start_time: datetime) -> List[str]:
         """查找包含目标时间范围内日志的所有 JSONL 文件"""
@@ -1116,11 +1123,12 @@ class LogWatcherPlugin(MaiBotPlugin):
         if not stream_id:
             return False, "stream_id 为空", 0
 
-        # 复用核心逻辑
+        message = kwargs.get("message", {})
         minutes = self.config.plugin.log_minutes
         log_path = self.config.plugin.log_file_path
+        chat_dir = self._get_chat_dir(message)
 
-        maisaka_output = await self._extract_maisaka_output(minutes, log_path)
+        maisaka_output = await self._extract_maisaka_output(minutes, log_path, chat_dir)
 
         if maisaka_output:
             if len(maisaka_output) > 4000:
@@ -1135,4 +1143,4 @@ class LogWatcherPlugin(MaiBotPlugin):
 def create_plugin():
     return LogWatcherPlugin()
 
-# try17 - 2026-07-11 _find_log_files改为读所有近2小时文件+按大小排序；添加/logfiles调试命令
+# try19 - 2026-07-11 聊天流优先匹配；Maisaka返回集成入日志小窥+LLM总结
